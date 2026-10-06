@@ -128,21 +128,86 @@ static bool update_activation(Mac *mac, CGEventFlags flags, CGEventRef event)
     return true;
 }
 
+static CGEventRef modifier_event(Mac *mac, CGKeyCode code, bool down, CGEventFlags flags)
+{
+    CGEventRef event = CGEventCreateKeyboardEvent(mac->wheel_source, code, down);
+    if (event) {
+        CGEventSetType(event, kCGEventFlagsChanged);
+        CGEventSetFlags(event, flags);
+        CGEventSetIntegerValueField(event, kCGEventSourceUserData, INPUT_MARKER);
+    }
+    return event;
+}
+
 static bool emit_scroll(Mac *mac, CGEventTapProxy proxy, CGEventFlags flags, ScrollDelta delta)
 {
     if (!delta.horizontal && !delta.vertical)
         return true;
-    CGEventRef event = CGEventCreateScrollWheelEvent(mac->wheel_source,
+    const ModifierKeys *key = binding(mac);
+    CGKeyCode codes[2] = {key->left_key, key->right_key};
+    CGEventFlags sides[2] = {key->left_flag, key->right_flag};
+    bool down[2] = {side_down(flags, key, false), side_down(flags, key, true)};
+    bool released[2] = {false, false};
+    unsigned binding_side = (unsigned)mac->config.modifier % 3;
+    CGEventFlags temporary = flags;
+    /* Fill missing sided bits from the physical snapshot so a right-side
+     * restore is also understood by applications' keyboard-state caches. */
+    for (unsigned i = 0; i < 2; ++i)
+        if (down[i]) temporary |= sides[i];
+    CGEventRef events[5] = {0};
+    unsigned count = 0;
+    bool success = false;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!down[i] || (binding_side == 1 && i != 0) || (binding_side == 2 && i != 1))
+            continue;
+        released[i] = true;
+        temporary &= ~sides[i];
+        if ((!down[0] || released[0]) && (!down[1] || released[1]))
+            temporary &= ~key->aggregate;
+        events[count] = modifier_event(mac, codes[i], false, temporary);
+        if (!events[count]) goto cleanup;
+        ++count;
+    }
+    unsigned wheel_index = count;
+    CGEventFlags neutral = temporary;
+    events[count] = CGEventCreateScrollWheelEvent(mac->wheel_source,
         kCGScrollEventUnitPixel, 2, delta.vertical, delta.horizontal);
-    if (!event)
-        return false;
-    CGEventSetIntegerValueField(event, kCGEventSourceUserData, INPUT_MARKER);
-    CGEventSetFlags(event, wheel_flags(mac, flags));
-    /* Insert immediately after this tap, as DragScroll does; do not queue a
-     * timer or send the converted event back through our own input filter. */
-    CGEventTapPostEvent(proxy, event);
-    CFRelease(event);
-    return true;
+    if (!events[count]) goto cleanup;
+    CGEventSetIntegerValueField(events[count], kCGEventSourceUserData, INPUT_MARKER);
+    CGEventSetFlags(events[count], wheel_flags(mac, neutral));
+    ++count;
+    for (unsigned i = 2; i-- > 0;) {
+        if (!released[i]) continue;
+        temporary |= sides[i] | key->aggregate;
+        events[count] = modifier_event(mac, codes[i], true, temporary);
+        if (!events[count]) goto cleanup;
+        ++count;
+    }
+    /* Ghostty uses cached keyboard modifiers for mouse reports, not the
+     * wheel's flags. Match Karabiner's modifier-up / wheel / modifier-down
+     * order while keeping both pixel axes together in ONE wheel event.
+     * Construct the complete batch before posting anything: allocation
+     * failure must never strand an application with a released modifier. */
+    CGEventTimestamp timestamp = CGEventGetTimestamp(events[0]);
+    temporary = neutral;
+    for (unsigned i = 0; i < count; ++i) {
+        if (i > wheel_index) {
+            CGKeyCode code = (CGKeyCode)CGEventGetIntegerValueField(events[i], kCGKeyboardEventKeycode);
+            /* Hardware can release the key while this callback is posting.
+             * Never synthesize a fresh press after that real release. The
+             * private injection source is not the physical HID state table. */
+            if (!CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code))
+                continue;
+            temporary |= (code == codes[0] ? sides[0] : sides[1]) | key->aggregate;
+            CGEventSetFlags(events[i], temporary);
+        }
+        CGEventSetTimestamp(events[i], timestamp + i);
+        CGEventTapPostEvent(proxy, events[i]);
+    }
+    success = true;
+cleanup:
+    for (unsigned i = 0; i < count; ++i) CFRelease(events[i]);
+    return success;
 }
 
 static CGEventRef on_input(CGEventTapProxy proxy, CGEventType type,
@@ -182,7 +247,7 @@ static CGEventRef on_input(CGEventTapProxy proxy, CGEventType type,
         return event;
     }
     if (!emit_scroll(mac, proxy, flags, delta)) {
-        fail(mac, "cannot create the scroll event; input filtering has stopped");
+        fail(mac, "cannot create the scroll/modifier event batch; input filtering has stopped");
         return event;
     }
     return NULL;
