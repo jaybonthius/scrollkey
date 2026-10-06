@@ -14,8 +14,8 @@ static void usage(FILE *stream)
           "MODIFIER: shift, control, alt, meta, or left_/right_ variants.\n"
           "Aliases: option=alt, command/win=meta, ctrl=control.\n"
           "\n"
-          "  --momentum-scroll-enabled true|false  Default: true\n"
           "  --speed-multiplier NUMBER             Default: 1.0; finite and > 0\n"
+          "                                       1.0 matches DragScroll's 3x speed\n"
           "  --help                               Show this help\n"
           "\n"
           "Example: scrollkey left_shift --speed-multiplier 0.5\n"
@@ -59,7 +59,7 @@ static const char *option_value(int *index, int argc, char **argv, const char *n
 
 int main(int argc, char **argv)
 {
-    ScrollConfig config = {SCROLL_MOD_LEFT_SHIFT, true, 1.0};
+    ScrollConfig config = {SCROLL_MOD_LEFT_SHIFT, 1.0};
     if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         usage(stdout);
         return 0;
@@ -70,19 +70,15 @@ int main(int argc, char **argv)
         return 2;
     }
     for (int i = 2; i < argc; ++i) {
-        const char *value = option_value(&i, argc, argv, "--momentum-scroll-enabled");
-        if (value) {
-            if (strcmp(value, "true") == 0)
-                config.momentum_scroll_enabled = true;
-            else if (strcmp(value, "false") == 0)
-                config.momentum_scroll_enabled = false;
-            else {
-                fputs("scrollkey: momentum must be true or false\n", stderr);
-                return 2;
-            }
-            continue;
+        const char *argument = argv[i];
+        const char *legacy = "--momentum-scroll-enabled";
+        size_t length = strlen(legacy);
+        if (strncmp(argument, legacy, length) == 0 &&
+            (argument[length] == '\0' || argument[length] == '=')) {
+            fputs("scrollkey: direct scrolling has no software momentum; remove --momentum-scroll-enabled\n", stderr);
+            return 2;
         }
-        value = option_value(&i, argc, argv, "--speed-multiplier");
+        const char *value = option_value(&i, argc, argv, "--speed-multiplier");
         if (value) {
             char *end;
             errno = 0;

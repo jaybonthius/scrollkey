@@ -13,7 +13,6 @@ typedef enum {
 
 typedef struct {
     ScrollModifier modifier;
-    bool momentum_scroll_enabled;
     double speed_multiplier;
 } ScrollConfig;
 

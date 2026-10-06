@@ -13,7 +13,6 @@
 #include "scroll.h"
 
 #define INPUT_MARKER ((ULONG_PTR)0x534b4559)
-#define TIMER_ID 1
 
 static const UINT key_pairs[][2] = {
     {VK_LSHIFT, VK_RSHIFT}, {VK_LCONTROL, VK_RCONTROL},
@@ -22,10 +21,10 @@ static const UINT key_pairs[][2] = {
 
 typedef struct {
     ScrollConfig config;
-    ScrollCounter *counter;
+    ScrollMotion motion;
     HWND window;
     HHOOK mouse_hook, keyboard_hook;
-    bool down[2], active, timer_running;
+    bool down[2], active;
     int result;
 } Windows;
 
@@ -34,8 +33,6 @@ static Windows *current;
 /* Written before registration; the console handler never touches stack state. */
 static DWORD console_thread;
 
-static int64_t now_ms(void) { return (int64_t)GetTickCount64(); }
-
 static bool modifier_down(const Windows *windows)
 {
     unsigned side = (unsigned)windows->config.modifier % 3;
@@ -43,21 +40,11 @@ static bool modifier_down(const Windows *windows)
            windows->down[0] || windows->down[1];
 }
 
-static void stop_timer(Windows *windows)
-{
-    if (windows->timer_running) {
-        KillTimer(windows->window, TIMER_ID);
-        windows->timer_running = false;
-    }
-}
-
 static void update_activation(Windows *windows)
 {
     windows->active = modifier_down(windows);
-    if (!windows->active) {
-        scroll_reset(windows->counter);
-        stop_timer(windows);
-    }
+    if (!windows->active)
+        scroll_reset(&windows->motion);
 }
 
 static void fail(Windows *windows, const char *message)
@@ -65,8 +52,7 @@ static void fail(Windows *windows, const char *message)
     fprintf(stderr, "scrollkey: %s (Windows error %lu)\n", message, GetLastError());
     windows->result = 1;
     windows->active = false;
-    scroll_reset(windows->counter);
-    stop_timer(windows);
+    scroll_reset(&windows->motion);
     PostQuitMessage(1);
 }
 
@@ -84,15 +70,17 @@ static bool key_input(INPUT *input, UINT virtual_key, bool up)
     return true;
 }
 
-static bool emit_scroll(void *context, int64_t time_ms, int horizontal, int vertical)
+static bool emit_scroll(Windows *windows, ScrollDelta delta)
 {
-    (void)time_ms;
-    Windows *windows = context;
-    if (!windows->active)
+    if (!windows->active || (!delta.horizontal && !delta.vertical))
         return true;
-    if (horizontal > LONG_MAX / WHEEL_DELTA || horizontal < LONG_MIN / WHEEL_DELTA ||
-        vertical > LONG_MAX / WHEEL_DELTA || vertical < LONG_MIN / WHEEL_DELTA)
+    if (delta.horizontal == INT_MIN)
         return false;
+    /* SendInput has no pixel-scroll API. Submit fine wheel units immediately,
+     * NOT a full 120-unit notch per pixel. Applications choose their own
+     * handling of partial notches; this is not identical to Quartz pixels. */
+    LONG horizontal = -(LONG)delta.horizontal;
+    LONG vertical = (LONG)delta.vertical;
     INPUT events[6] = {0};
     UINT count = 0, released[2], release_count = 0;
     unsigned family = (unsigned)windows->config.modifier / 3;
@@ -108,21 +96,20 @@ static bool emit_scroll(void *context, int64_t time_ms, int horizontal, int vert
     if (vertical) {
         events[count].type = INPUT_MOUSE;
         events[count].mi.dwFlags = MOUSEEVENTF_WHEEL;
-        events[count].mi.mouseData = (DWORD)(LONG)(vertical * WHEEL_DELTA);
+        events[count].mi.mouseData = (DWORD)vertical;
         events[count++].mi.dwExtraInfo = INPUT_MARKER;
     }
     if (horizontal) {
         events[count].type = INPUT_MOUSE;
         events[count].mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        events[count].mi.mouseData = (DWORD)(LONG)(horizontal * WHEEL_DELTA);
+        events[count].mi.mouseData = (DWORD)horizontal;
         events[count++].mi.dwExtraInfo = INPUT_MARKER;
     }
     for (UINT i = 0; i < release_count; ++i)
         if (!key_input(&events[count++], released[i], false))
             return false;
     /* SendInput submits the up/wheel/down batch without interleaving other
-     * input. This mirrors Karabiner's modifier neutralization. Our own key
-     * events must not alter the physical activation state in key_hook. */
+     * input. Our own key events must not alter physical activation state. */
     UINT sent = SendInput(count, events, sizeof(INPUT));
     if (sent != count) {
         /* Best-effort restore after a partial submission, then stop filtering.
@@ -163,7 +150,7 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM message, LPARAM data)
     if (code == HC_ACTION && windows && windows->active && !windows->result) {
         const MSLLHOOKSTRUCT *event = (const MSLLHOOKSTRUCT *)data;
         if (event->dwExtraInfo != INPUT_MARKER &&
-            (message == WM_MOUSEMOVE || message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL))
+            message == WM_MOUSEMOVE)
             return 1;
     }
     return CallNextHookEx(NULL, code, message, data);
@@ -191,18 +178,15 @@ static void raw_input(Windows *windows, HRAWINPUT handle)
         return;
     }
     int x = input.data.mouse.lLastX, y = input.data.mouse.lLastY;
-    if (!x && !y && !(input.data.mouse.usButtonFlags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)))
-        return; /* A button-only packet is not Karabiner pointing motion. */
-    if (!scroll_input(windows->counter, x, y, now_ms())) {
-        fail(windows, "cannot queue movement; input filtering has stopped");
+    if (!x && !y)
+        return; /* Wheel and button-only packets are not converted. */
+    ScrollDelta delta;
+    if (!scroll_input(&windows->motion, x, y, &delta)) {
+        fail(windows, "cannot convert movement; input filtering has stopped");
         return;
     }
-    if (!windows->timer_running) {
-        if (!SetTimer(windows->window, TIMER_ID, 20, NULL))
-            fail(windows, "cannot start the scrolling timer");
-        else
-            windows->timer_running = true;
-    }
+    if (!emit_scroll(windows, delta))
+        fail(windows, "scroll injection failed (check speed and target app privileges)");
 }
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
@@ -217,13 +201,6 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         raw_input(windows, (HRAWINPUT)lparam);
         /* DefWindowProc is required to release foreground WM_INPUT resources. */
         return DefWindowProcW(window, message, wparam, lparam);
-    }
-    if (windows && message == WM_TIMER && wparam == TIMER_ID) {
-        if (!windows->result && !scroll_tick(windows->counter, now_ms(), emit_scroll, windows))
-            fail(windows, "scroll counter/injection failed (check speed and target app privileges)");
-        if (scroll_deadline(windows->counter) < 0)
-            stop_timer(windows);
-        return 0;
     }
     if (message == WM_CLOSE) {
         PostQuitMessage(0);
@@ -245,9 +222,8 @@ int platform_run(const ScrollConfig *config)
 {
     Windows windows = {0};
     windows.config = *config;
-    windows.counter = scroll_create(config->speed_multiplier, config->momentum_scroll_enabled);
-    if (!windows.counter) {
-        fputs("scrollkey: cannot create the scroll counter\n", stderr);
+    if (!scroll_init(&windows.motion, config->speed_multiplier)) {
+        fputs("scrollkey: cannot initialize scrolling speed\n", stderr);
         return 1;
     }
     HINSTANCE instance = GetModuleHandleW(NULL);
@@ -256,7 +232,6 @@ int platform_run(const ScrollConfig *config)
     window_class.hInstance = instance;
     window_class.lpszClassName = L"ScrollkeyInput";
     if (!RegisterClassW(&window_class)) {
-        scroll_destroy(windows.counter);
         fputs("scrollkey: cannot register the input window\n", stderr);
         return 1;
     }
@@ -264,7 +239,6 @@ int platform_run(const ScrollConfig *config)
         0, 0, 0, 0, HWND_MESSAGE, NULL, instance, &windows);
     if (!windows.window) {
         UnregisterClassW(window_class.lpszClassName, instance);
-        scroll_destroy(windows.counter);
         fputs("scrollkey: cannot create the input window\n", stderr);
         return 1;
     }
@@ -272,7 +246,6 @@ int platform_run(const ScrollConfig *config)
     if (!RegisterRawInputDevices(&device, 1, sizeof(device))) {
         DestroyWindow(windows.window);
         UnregisterClassW(window_class.lpszClassName, instance);
-        scroll_destroy(windows.counter);
         fputs("scrollkey: cannot register raw mouse input\n", stderr);
         return 1;
     }
@@ -300,7 +273,7 @@ int platform_run(const ScrollConfig *config)
         }
     }
     windows.active = false;
-    stop_timer(&windows);
+    scroll_reset(&windows.motion);
     if (windows.mouse_hook) UnhookWindowsHookEx(windows.mouse_hook);
     if (windows.keyboard_hook) UnhookWindowsHookEx(windows.keyboard_hook);
     current = NULL;
@@ -310,6 +283,5 @@ int platform_run(const ScrollConfig *config)
     RegisterRawInputDevices(&device, 1, sizeof(device));
     DestroyWindow(windows.window);
     UnregisterClassW(window_class.lpszClassName, instance);
-    scroll_destroy(windows.counter);
     return windows.result;
 }
