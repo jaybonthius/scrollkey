@@ -6,11 +6,21 @@ stdenv.mkDerivation {
 
   src = lib.cleanSourceWith {
     src = ./.;
-    filter = path: type: !(builtins.elem (builtins.baseNameOf path) [ ".git" "build" ".DS_Store" ]);
+    filter =
+      path: type:
+      !(builtins.elem (builtins.baseNameOf path) [
+        ".git"
+        "build"
+        ".DS_Store"
+      ]);
   };
 
   # The Nix compiler supplies its own macOS SDK; do not call host xcrun.
-  makeFlags = [ "CC=cc" "SDKFLAGS=" "PREFIX=$(out)" ];
+  makeFlags = [
+    "CC=cc"
+    "SDKFLAGS="
+    "PREFIX=$(out)"
+  ];
 
   doCheck = true;
   checkPhase = ''

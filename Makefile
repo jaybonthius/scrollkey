@@ -28,8 +28,9 @@ build/scrollkey: src/main.c src/scroll.c $(PLATFORM) src/scroll.h src/platform.h
 	$(CC) $(CFLAGS) $(SDKFLAGS) src/main.c src/scroll.c $(PLATFORM) $(LDLIBS) -o $@
 
 install: build/scrollkey
-	install -d "$(DESTDIR)$(PREFIX)/bin"
+	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/share/licenses/scrollkey"
 	install -m755 build/scrollkey "$(DESTDIR)$(PREFIX)/bin/scrollkey"
+	install -m644 LICENSE THIRD_PARTY_NOTICES "$(DESTDIR)$(PREFIX)/share/licenses/scrollkey"
 
 build/scroll-test: tests/scroll.c src/scroll.c src/scroll.h | build
 	$(CC) $(CFLAGS) $(SDKFLAGS) -Isrc tests/scroll.c src/scroll.c -lm -o $@
