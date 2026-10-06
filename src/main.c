@@ -16,9 +16,12 @@ static void usage(FILE *stream)
           "\n"
           "  --speed-multiplier NUMBER             Default: 1.0; finite and > 0\n"
           "                                       1.0 matches DragScroll's 3x speed\n"
+          "  --diagonal on|off                    Default: on; off uses one axis\n"
+          "  --diagonal-modifier MODIFIER         Reverse diagonal setting while held\n"
+          "                                       Default: none; use a separate key\n"
           "  --help                               Show this help\n"
           "\n"
-          "Example: scrollkey left_shift --speed-multiplier 0.5\n"
+          "Example: scrollkey left_shift --diagonal off --diagonal-modifier left_control\n"
           "Release the modifier to stop scrolling. Ctrl+C exits.\n", stream);
 }
 
@@ -59,7 +62,10 @@ static const char *option_value(int *index, int argc, char **argv, const char *n
 
 int main(int argc, char **argv)
 {
-    ScrollConfig config = {SCROLL_MOD_LEFT_SHIFT, 1.0};
+    ScrollConfig config = {
+        .modifier = SCROLL_MOD_LEFT_SHIFT, .speed_multiplier = 1.0,
+        .diagonal = true, .diagonal_modifier = SCROLL_MOD_NONE
+    };
     if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         usage(stdout);
         return 0;
@@ -90,7 +96,29 @@ int main(int argc, char **argv)
             config.speed_multiplier = speed;
             continue;
         }
+        value = option_value(&i, argc, argv, "--diagonal");
+        if (value) {
+            if (strcmp(value, "on") == 0) config.diagonal = true;
+            else if (strcmp(value, "off") == 0) config.diagonal = false;
+            else {
+                fputs("scrollkey: --diagonal must be on or off\n", stderr);
+                return 2;
+            }
+            continue;
+        }
+        value = option_value(&i, argc, argv, "--diagonal-modifier");
+        if (value) {
+            if (!parse_modifier(value, &config.diagonal_modifier)) {
+                fputs("scrollkey: --diagonal-modifier requires a supported modifier key\n", stderr);
+                return 2;
+            }
+            continue;
+        }
         fprintf(stderr, "scrollkey: unknown option or missing value: %s\n", argv[i]);
+        return 2;
+    }
+    if (scroll_modifier_mask(config.modifier) & scroll_modifier_mask(config.diagonal_modifier)) {
+        fputs("scrollkey: diagonal modifier must not overlap the activation key\n", stderr);
         return 2;
     }
     return platform_run(&config);

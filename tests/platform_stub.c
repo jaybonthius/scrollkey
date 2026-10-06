@@ -6,8 +6,9 @@ int platform_run(const ScrollConfig *config)
 {
     static const char *names[] = {
         "shift", "left_shift", "right_shift", "control", "left_control", "right_control",
-        "alt", "left_alt", "right_alt", "meta", "left_meta", "right_meta"
+        "alt", "left_alt", "right_alt", "meta", "left_meta", "right_meta", "none"
     };
-    printf("%s %.17g\n", names[config->modifier], config->speed_multiplier);
+    printf("%s %.17g diagonal=%s diagonal_modifier=%s\n", names[config->modifier],
+           config->speed_multiplier, config->diagonal ? "on" : "off", names[config->diagonal_modifier]);
     return 0;
 }

@@ -24,7 +24,8 @@ typedef struct {
     ScrollMotion motion;
     HWND window;
     HHOOK mouse_hook, keyboard_hook;
-    bool down[2], active;
+    unsigned down; /* Physical modifier-key bits; marked injection never updates them. */
+    bool active;
     int result;
 } Windows;
 
@@ -33,16 +34,17 @@ static Windows *current;
 /* Written before registration; the console handler never touches stack state. */
 static DWORD console_thread;
 
-static bool modifier_down(const Windows *windows)
+static bool modifier_down(const Windows *windows, ScrollModifier modifier)
 {
-    unsigned side = (unsigned)windows->config.modifier % 3;
-    return side == 1 ? windows->down[0] : side == 2 ? windows->down[1] :
-           windows->down[0] || windows->down[1];
+    return (windows->down & scroll_modifier_mask(modifier)) != 0;
 }
 
 static void update_activation(Windows *windows)
 {
-    windows->active = modifier_down(windows);
+    bool diagonal = windows->config.diagonal;
+    if (modifier_down(windows, windows->config.diagonal_modifier)) diagonal = !diagonal;
+    scroll_set_diagonal(&windows->motion, diagonal);
+    windows->active = modifier_down(windows, windows->config.modifier);
     if (!windows->active)
         scroll_reset(&windows->motion);
 }
@@ -81,14 +83,13 @@ static bool emit_scroll(Windows *windows, ScrollDelta delta)
      * handling of partial notches; this is not identical to Quartz pixels. */
     LONG horizontal = -(LONG)delta.horizontal;
     LONG vertical = (LONG)delta.vertical;
-    INPUT events[6] = {0};
-    UINT count = 0, released[2], release_count = 0;
-    unsigned family = (unsigned)windows->config.modifier / 3;
-    unsigned side = (unsigned)windows->config.modifier % 3;
-    for (unsigned i = 0; i < 2; ++i) {
-        if (!windows->down[i] || (side == 1 && i != 0) || (side == 2 && i != 1))
-            continue;
-        UINT key = key_pairs[family][i];
+    /* Two bindings select at most four keys, plus two wheel events. */
+    INPUT events[10] = {0};
+    UINT count = 0, released[4], release_count = 0;
+    unsigned selected = scroll_output_modifiers(&windows->config);
+    for (unsigned i = 0; i < 8; ++i) {
+        if (!(selected & windows->down & (1u << i))) continue;
+        UINT key = key_pairs[i / 2][i % 2];
         if (!key_input(&events[count++], key, true))
             return false;
         released[release_count++] = key;
@@ -114,7 +115,7 @@ static bool emit_scroll(Windows *windows, ScrollDelta delta)
     if (sent != count) {
         /* Best-effort restore after a partial submission, then stop filtering.
          * No elevation attempt: UIPI can prevent injection into elevated apps. */
-        INPUT restore[2] = {0};
+        INPUT restore[4] = {0};
         for (UINT i = 0; i < release_count; ++i)
             key_input(&restore[i], released[i], false);
         if (release_count) SendInput(release_count, restore, sizeof(INPUT));
@@ -133,11 +134,13 @@ static LRESULT CALLBACK key_hook(int code, WPARAM message, LPARAM data)
             if (key == VK_SHIFT) key = event->scanCode == 0x36 ? VK_RSHIFT : VK_LSHIFT;
             if (key == VK_CONTROL) key = event->flags & LLKHF_EXTENDED ? VK_RCONTROL : VK_LCONTROL;
             if (key == VK_MENU) key = event->flags & LLKHF_EXTENDED ? VK_RMENU : VK_LMENU;
-            unsigned family = (unsigned)windows->config.modifier / 3;
-            for (unsigned i = 0; i < 2; ++i)
-                if (key == key_pairs[family][i]) {
-                    windows->down[i] = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+            for (unsigned i = 0; i < 8; ++i)
+                if (key == key_pairs[i / 2][i % 2]) {
+                    if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
+                        windows->down |= 1u << i;
+                    else windows->down &= ~(1u << i);
                     update_activation(windows);
+                    break;
                 }
         }
     }
@@ -249,10 +252,10 @@ int platform_run(const ScrollConfig *config)
         fputs("scrollkey: cannot register raw mouse input\n", stderr);
         return 1;
     }
-    unsigned family = (unsigned)config->modifier / 3;
-    for (unsigned i = 0; i < 2; ++i)
-        windows.down[i] = (GetAsyncKeyState((int)key_pairs[family][i]) & 0x8000) != 0;
-    windows.active = modifier_down(&windows);
+    for (unsigned i = 0; i < 8; ++i)
+        if (GetAsyncKeyState((int)key_pairs[i / 2][i % 2]) & 0x8000)
+            windows.down |= 1u << i;
+    update_activation(&windows);
     current = &windows;
     windows.keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, key_hook, instance, 0);
     windows.mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook, instance, 0);

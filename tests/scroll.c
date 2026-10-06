@@ -89,8 +89,56 @@ static void safe_failures(void)
     puts("invalid settings and arithmetic failures passed");
 }
 
+static void diagonal_modes(void)
+{
+    ScrollMotion motion;
+    ScrollDelta output;
+    CHECK(scroll_init(&motion, 1.0));
+    scroll_set_diagonal(&motion, false);
+    CHECK(scroll_input(&motion, 4, -7, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 21);
+    /* Near-diagonal wobble must not repeatedly swap the selected axis. */
+    CHECK(scroll_input(&motion, 8, -7, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 21);
+    CHECK(scroll_input(&motion, -7, 8, &output));
+    CHECK(output.horizontal == 0 && output.vertical == -24);
+    CHECK(scroll_input(&motion, 0, 0, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 0);
+    /* A deliberate turn switches immediately, without releasing the key. */
+    CHECK(scroll_input(&motion, 14, -7, &output));
+    CHECK(output.horizontal == -42 && output.vertical == 0);
+    CHECK(scroll_input(&motion, -8, 7, &output));
+    CHECK(output.horizontal == 24 && output.vertical == 0);
+    scroll_set_diagonal(&motion, true);
+    CHECK(scroll_input(&motion, 4, -7, &output));
+    CHECK(output.horizontal == -12 && output.vertical == 21);
+    scroll_set_diagonal(&motion, false);
+    CHECK(scroll_input(&motion, 4, -7, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 21);
+    scroll_reset(&motion);
+    CHECK(scroll_input(&motion, 7, 4, &output));
+    CHECK(output.horizontal == -21 && output.vertical == 0);
+    CHECK(scroll_init(&motion, 0.125));
+    scroll_set_diagonal(&motion, false);
+    CHECK(scroll_input(&motion, 1, 1, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 0); /* Ties favor vertical. */
+    scroll_set_diagonal(&motion, true); /* Drop old single-axis fractional carry. */
+    CHECK(scroll_input(&motion, 1, 1, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 0);
+    scroll_set_diagonal(&motion, true); /* Same mode must NOT discard new carry. */
+    CHECK(scroll_input(&motion, 1, 1, &output));
+    CHECK(output.horizontal == 0 && output.vertical == 0);
+    CHECK(scroll_input(&motion, 1, 1, &output));
+    CHECK(output.horizontal == -1 && output.vertical == -1);
+    scroll_set_diagonal(&motion, false);
+    CHECK(scroll_input(&motion, INT_MIN, 0, &output) == true);
+    CHECK(output.horizontal > 0 && output.vertical == 0);
+    puts("diagonal modes, stable single-axis selection, turns and mode-change carry passed");
+}
+
 int main(void)
 {
+    diagonal_modes();
     reference_motion();
     fractional_speed_and_release();
     safe_failures();

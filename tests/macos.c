@@ -18,7 +18,7 @@ static CGError warp_error;
 static CGPoint last_warp;
 static double suppression;
 static bool physical_keys[128];
-static bool release_shift_during_wheel;
+static int release_key_during_wheel;
 static unsigned key_creations, fail_key_creation_at;
 
 static void capture_post(CGEventTapLocation location, CGEventRef event)
@@ -35,7 +35,7 @@ static void capture_post(CGEventTapLocation location, CGEventRef event)
         output = CGEventCreateCopy(event);
         CHECK(output);
         ++posted;
-        if (release_shift_during_wheel) physical_keys[56] = false;
+        if (release_key_during_wheel >= 0) physical_keys[release_key_during_wheel] = false;
     }
 }
 
@@ -87,7 +87,10 @@ static CGEventRef create_keyboard(CGEventSourceRef source, CGKeyCode code, bool 
 static void initialize(Mac *mac, double speed)
 {
     *mac = (Mac){0};
-    mac->config = (ScrollConfig){SCROLL_MOD_LEFT_SHIFT, speed};
+    mac->config = (ScrollConfig){
+        .modifier = SCROLL_MOD_LEFT_SHIFT, .speed_multiplier = speed,
+        .diagonal = true, .diagonal_modifier = SCROLL_MOD_NONE
+    };
     mac->loop = CFRunLoopGetCurrent();
     CHECK(scroll_init(&mac->motion, speed));
     mac->wheel_source = CGEventSourceCreate(kCGEventSourceStatePrivate);
@@ -96,7 +99,7 @@ static void initialize(Mac *mac, double speed)
     mac->original_suppression = 0.375; /* Test restoring a non-default value. */
     posted = warped = delivered_count = 0;
     receiver_flags = wheel_receiver_flags = 0;
-    release_shift_during_wheel = false;
+    release_key_during_wheel = -1;
     key_creations = fail_key_creation_at = 0;
     warp_error = kCGErrorSuccess;
     suppression = mac->original_suppression;
@@ -285,7 +288,7 @@ static void physical_release_during_scroll(void)
     CGEventFlags held = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
     physical_keys[56] = true;
     receiver_flags = held;
-    release_shift_during_wheel = true;
+    release_key_during_wheel = 56;
     CGEventRef event = motion(held, 1, 2);
     CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
     CHECK(posted == 1);
@@ -395,8 +398,188 @@ static void right_side_fallback_and_zero_motion(void)
     puts("macOS right-side HID fallback, diagonal signs and zero-motion passthrough passed");
 }
 
+static void held_diagonal_modifier(void)
+{
+    for (unsigned baseline = 0; baseline < 2; ++baseline) {
+        Mac mac;
+        initialize(&mac, 1.0);
+        mac.config.diagonal = baseline != 0;
+        mac.config.diagonal_modifier = SCROLL_MOD_LEFT_CONTROL;
+        physical_keys[56] = true;
+        CGEventFlags shift = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+        CGEventFlags chord = shift | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
+        receiver_flags = shift;
+        CGEventRef event = motion(shift, 4, -7);
+        CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+        CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == (baseline ? -12 : 0));
+        physical_keys[59] = true;
+        receiver_flags = chord;
+        CGEventSetFlags(event, chord);
+        CGEventSetType(event, kCGEventFlagsChanged);
+        CHECK(on_input(NULL, kCGEventFlagsChanged, event, &mac) == event);
+        CHECK(posted == 1 && mac.active);
+        CGEventSetType(event, kCGEventMouseMoved);
+        CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+        CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis1) == 21);
+        CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == (baseline ? 0 : -12));
+        CHECK(!(wheel_receiver_flags & (kCGEventFlagMaskShift | kCGEventFlagMaskControl)));
+        CHECK(!(CGEventGetFlags(output) & (kCGEventFlagMaskShift | kCGEventFlagMaskControl)));
+        CHECK(receiver_flags == chord);
+        physical_keys[59] = false;
+        receiver_flags = shift;
+        CGEventSetFlags(event, shift);
+        CGEventSetType(event, kCGEventFlagsChanged);
+        CHECK(on_input(NULL, kCGEventFlagsChanged, event, &mac) == event);
+        CGEventSetType(event, kCGEventMouseMoved);
+        CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+        CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == (baseline ? -12 : 0));
+        CHECK(posted == 3 && mac.active);
+        /* The mode key on its own must not activate pointer conversion. */
+        physical_keys[56] = false;
+        physical_keys[59] = true;
+        CGEventSetFlags(event, kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK);
+        CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == event);
+        CHECK(!mac.active && posted == 3);
+        CFRelease(event);
+        dispose(&mac);
+    }
+    puts("macOS both held-key directions, cache neutralization and release-to-default passed");
+}
+
+static void diagonal_modifier_variants(void)
+{
+    for (unsigned family = 0; family < 4; ++family) {
+        for (unsigned side = 0; side < 3; ++side) {
+            Mac mac;
+            initialize(&mac, 1.0);
+            unsigned base_family = (family + 1) % 4;
+            const ModifierKeys *base = &keys[base_family], *mode = &keys[family];
+            mac.config.modifier = (ScrollModifier)(3 * base_family);
+            mac.config.diagonal = false;
+            mac.config.diagonal_modifier = (ScrollModifier)(3 * family + side);
+            physical_keys[base->left_key] = physical_keys[base->right_key] = true;
+            physical_keys[mode->left_key] = side != 2;
+            physical_keys[mode->right_key] = side != 1;
+            CGEventFlags base_flags = base->aggregate | base->left_flag | base->right_flag | kCGEventFlagMaskAlphaShift;
+            CGEventFlags chord = base_flags | mode->aggregate;
+            if (side != 2) chord |= mode->left_flag;
+            if (side != 1) chord |= mode->right_flag;
+            receiver_flags = chord;
+            CGEventRef event = motion(chord, 4, -7);
+            CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+            CHECK(posted == 1 && delivered_count == (side == 0 ? 9 : 7));
+            CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == -12);
+            CHECK(CGEventGetFlags(output) == kCGEventFlagMaskAlphaShift);
+            CHECK(wheel_receiver_flags == kCGEventFlagMaskAlphaShift && receiver_flags == chord);
+            for (unsigned i = 0; i < delivered_count; ++i)
+                CHECK(on_input(NULL, CGEventGetType(delivered[i]), delivered[i], &mac) == delivered[i]);
+            CHECK(posted == 1 && mac.active);
+            physical_keys[mode->left_key] = physical_keys[mode->right_key] = false;
+            CGEventSetFlags(event, base_flags);
+            receiver_flags = base_flags;
+            CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+            CHECK(posted == 2);
+            CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == 0);
+            CFRelease(event);
+            dispose(&mac);
+        }
+    }
+    /* Independent left/right keys in the SAME family are also valid. */
+    Mac mac;
+    initialize(&mac, 1.0);
+    mac.config.diagonal = false;
+    mac.config.diagonal_modifier = SCROLL_MOD_RIGHT_SHIFT;
+    physical_keys[56] = physical_keys[60] = true;
+    CGEventFlags chord = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
+    receiver_flags = chord;
+    CGEventRef event = motion(chord, 4, -7);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(delivered_count == 5 && !wheel_receiver_flags && receiver_flags == chord);
+    CHECK(CGEventGetFlags(output) == 0);
+    CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == -12);
+    CFRelease(event);
+    dispose(&mac);
+    /* Wrong-side Control must not switch modes or lose its normal meaning. */
+    initialize(&mac, 1.0);
+    mac.config.diagonal = false;
+    mac.config.diagonal_modifier = SCROLL_MOD_LEFT_CONTROL;
+    physical_keys[56] = physical_keys[62] = true;
+    chord = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK | kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK;
+    receiver_flags = chord;
+    event = motion(chord, 4, -7);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis2) == 0);
+    CHECK(wheel_receiver_flags == (kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK));
+    CHECK(receiver_flags == chord);
+    CFRelease(event);
+    dispose(&mac);
+    puts("macOS all mode-key variants, maximum nine-event chord and opposite-side semantics passed");
+}
+
+static void diagonal_modifier_lifecycle(void)
+{
+    /* A short press/release between mouse packets must discard old carry. */
+    Mac mac;
+    initialize(&mac, 0.125);
+    mac.config.diagonal = false;
+    mac.config.diagonal_modifier = SCROLL_MOD_LEFT_CONTROL;
+    physical_keys[56] = true;
+    CGEventFlags shift = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK;
+    CGEventFlags chord = shift | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK;
+    CGEventRef event = motion(shift, 1, 1);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CGEventSetType(event, kCGEventFlagsChanged);
+    physical_keys[59] = true;
+    CGEventSetFlags(event, chord);
+    CHECK(on_input(NULL, kCGEventFlagsChanged, event, &mac) == event);
+    physical_keys[59] = false;
+    CGEventSetFlags(event, shift);
+    CHECK(on_input(NULL, kCGEventFlagsChanged, event, &mac) == event);
+    CGEventSetType(event, kCGEventMouseMoved);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(!posted && !delivered_count);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(posted == 1);
+    CHECK(CGEventGetIntegerValueField(output, kCGScrollWheelEventPointDeltaAxis1) == -1);
+    CFRelease(event);
+    dispose(&mac);
+    /* The mode modifier can physically release during the posted wheel. */
+    initialize(&mac, 1.0);
+    mac.config.diagonal = false;
+    mac.config.diagonal_modifier = SCROLL_MOD_LEFT_CONTROL;
+    physical_keys[56] = physical_keys[59] = true;
+    receiver_flags = chord;
+    release_key_during_wheel = 59;
+    event = motion(chord, 4, -7);
+    CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == NULL);
+    CHECK(delivered_count == 4 && receiver_flags == shift);
+    CHECK(!wheel_receiver_flags && !(CGEventGetFlags(output) & kCGEventFlagMaskControl));
+    CFRelease(event);
+    dispose(&mac);
+    /* Any constructor failure in a maximum-size batch posts nothing. */
+    for (unsigned failure = 1; failure <= 8; ++failure) {
+        initialize(&mac, 1.0);
+        mac.config.modifier = SCROLL_MOD_SHIFT;
+        mac.config.diagonal_modifier = SCROLL_MOD_CONTROL;
+        physical_keys[56] = physical_keys[60] = physical_keys[59] = physical_keys[62] = true;
+        chord = shift | NX_DEVICERSHIFTKEYMASK | kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK;
+        receiver_flags = chord;
+        fail_key_creation_at = failure;
+        event = motion(chord, 4, -7);
+        CHECK(on_input(NULL, kCGEventMouseMoved, event, &mac) == event);
+        CHECK(mac.result == 1 && !mac.active && !delivered_count && receiver_flags == chord);
+        CFRelease(event);
+        dispose(&mac);
+    }
+    puts("macOS mode-change carry, physical mode-key release and complete-batch failure cleanup passed");
+}
+
 int main(void)
 {
+    diagonal_modifier_lifecycle();
+    diagonal_modifier_variants();
+    held_diagonal_modifier();
     right_side_fallback_and_zero_motion();
     modifier_batch_failures_and_bindings();
     physical_release_during_scroll();

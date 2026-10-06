@@ -39,11 +39,6 @@ typedef struct {
     int result;
 } Mac;
 
-static const ModifierKeys *binding(const Mac *mac)
-{
-    return &keys[(unsigned)mac->config.modifier / 3];
-}
-
 static bool side_down(CGEventFlags flags, const ModifierKeys *key, bool right)
 {
     CGEventFlags sides = flags & (key->left_flag | key->right_flag);
@@ -55,25 +50,14 @@ static bool side_down(CGEventFlags flags, const ModifierKeys *key, bool right)
                                                           right ? key->right_key : key->left_key);
 }
 
-static bool modifier_down(const Mac *mac, CGEventFlags flags)
+static bool modifier_down(ScrollModifier modifier, CGEventFlags flags)
 {
-    const ModifierKeys *key = binding(mac);
-    unsigned side = (unsigned)mac->config.modifier % 3;
+    if (modifier == SCROLL_MOD_NONE) return false;
+    const ModifierKeys *key = &keys[(unsigned)modifier / 3];
+    unsigned side = (unsigned)modifier % 3;
     if (side == 1) return side_down(flags, key, false);
     if (side == 2) return side_down(flags, key, true);
     return (flags & key->aggregate) != 0;
-}
-
-static CGEventFlags wheel_flags(const Mac *mac, CGEventFlags flags)
-{
-    const ModifierKeys *key = binding(mac);
-    unsigned side = (unsigned)mac->config.modifier % 3;
-    bool other_down = side == 1 ? side_down(flags, key, true) :
-                      side == 2 ? side_down(flags, key, false) : false;
-    if (side != 2) flags &= ~key->left_flag;
-    if (side != 1) flags &= ~key->right_flag;
-    if (!other_down) flags &= ~key->aggregate;
-    return flags;
 }
 
 static bool release_pointer(Mac *mac)
@@ -101,7 +85,10 @@ static void fail(Mac *mac, const char *message)
 
 static bool update_activation(Mac *mac, CGEventFlags flags, CGEventRef event)
 {
-    if (!modifier_down(mac, flags)) {
+    bool diagonal = mac->config.diagonal;
+    if (modifier_down(mac->config.diagonal_modifier, flags)) diagonal = !diagonal;
+    scroll_set_diagonal(&mac->motion, diagonal);
+    if (!modifier_down(mac->config.modifier, flags)) {
         if (!release_pointer(mac)) {
             fail(mac, "cannot release the cursor anchor; input filtering has stopped");
             return false;
@@ -129,6 +116,9 @@ static bool update_activation(Mac *mac, CGEventFlags flags, CGEventRef event)
 }
 
 static CGEventRef modifier_event(Mac *mac, CGKeyCode code, bool down, CGEventFlags flags)
+    CF_RETURNS_RETAINED;
+
+static CGEventRef modifier_event(Mac *mac, CGKeyCode code, bool down, CGEventFlags flags)
 {
     CGEventRef event = CGEventCreateKeyboardEvent(mac->wheel_source, code, down);
     if (event) {
@@ -143,29 +133,37 @@ static bool emit_scroll(Mac *mac, CGEventTapProxy proxy, CGEventFlags flags, Scr
 {
     if (!delta.horizontal && !delta.vertical)
         return true;
-    const ModifierKeys *key = binding(mac);
-    CGKeyCode codes[2] = {key->left_key, key->right_key};
-    CGEventFlags sides[2] = {key->left_flag, key->right_flag};
-    bool down[2] = {side_down(flags, key, false), side_down(flags, key, true)};
-    bool released[2] = {false, false};
-    unsigned binding_side = (unsigned)mac->config.modifier % 3;
+    unsigned selected = scroll_output_modifiers(&mac->config);
+    unsigned held = 0, released[4], release_count = 0;
     CGEventFlags temporary = flags;
-    /* Fill missing sided bits from the physical snapshot so a right-side
-     * restore is also understood by applications' keyboard-state caches. */
-    for (unsigned i = 0; i < 2; ++i)
-        if (down[i]) temporary |= sides[i];
-    CGEventRef events[5] = {0};
+    /* One physical snapshot supplies both keyboard and wheel flags, including
+     * unselected opposite-side keys that must retain their normal meaning. */
+    for (unsigned family = 0; family < 4; ++family) {
+        if (!(selected & (3u << (2 * family)))) continue;
+        const ModifierKeys *key = &keys[family];
+        temporary &= ~(key->left_flag | key->right_flag | key->aggregate);
+        if (side_down(flags, key, false)) {
+            held |= 1u << (2 * family);
+            temporary |= key->left_flag | key->aggregate;
+        }
+        if (side_down(flags, key, true)) {
+            held |= 2u << (2 * family);
+            temporary |= key->right_flag | key->aggregate;
+        }
+    }
+    /* Two bindings select at most four keys: up*4, wheel, down*4. */
+    CGEventRef events[9] = {0};
     unsigned count = 0;
     bool success = false;
-    for (unsigned i = 0; i < 2; ++i) {
-        if (!down[i] || (binding_side == 1 && i != 0) || (binding_side == 2 && i != 1))
-            continue;
-        released[i] = true;
-        temporary &= ~sides[i];
-        if ((!down[0] || released[0]) && (!down[1] || released[1]))
-            temporary &= ~key->aggregate;
-        events[count] = modifier_event(mac, codes[i], false, temporary);
+    for (unsigned i = 0; i < 8; ++i) {
+        if (!(selected & held & (1u << i))) continue;
+        const ModifierKeys *key = &keys[i / 2];
+        held &= ~(1u << i);
+        temporary &= ~(i % 2 ? key->right_flag : key->left_flag);
+        if (!(held & (3u << (2 * (i / 2))))) temporary &= ~key->aggregate;
+        events[count] = modifier_event(mac, i % 2 ? key->right_key : key->left_key, false, temporary);
         if (!events[count]) goto cleanup;
+        released[release_count++] = i;
         ++count;
     }
     unsigned wheel_index = count;
@@ -174,12 +172,13 @@ static bool emit_scroll(Mac *mac, CGEventTapProxy proxy, CGEventFlags flags, Scr
         kCGScrollEventUnitPixel, 2, delta.vertical, delta.horizontal);
     if (!events[count]) goto cleanup;
     CGEventSetIntegerValueField(events[count], kCGEventSourceUserData, INPUT_MARKER);
-    CGEventSetFlags(events[count], wheel_flags(mac, neutral));
+    CGEventSetFlags(events[count], neutral);
     ++count;
-    for (unsigned i = 2; i-- > 0;) {
-        if (!released[i]) continue;
-        temporary |= sides[i] | key->aggregate;
-        events[count] = modifier_event(mac, codes[i], true, temporary);
+    for (unsigned r = release_count; r-- > 0;) {
+        unsigned i = released[r];
+        const ModifierKeys *key = &keys[i / 2];
+        temporary |= (i % 2 ? key->right_flag : key->left_flag) | key->aggregate;
+        events[count] = modifier_event(mac, i % 2 ? key->right_key : key->left_key, true, temporary);
         if (!events[count]) goto cleanup;
         ++count;
     }
@@ -190,15 +189,18 @@ static bool emit_scroll(Mac *mac, CGEventTapProxy proxy, CGEventFlags flags, Scr
      * failure must never strand an application with a released modifier. */
     CGEventTimestamp timestamp = CGEventGetTimestamp(events[0]);
     temporary = neutral;
+    unsigned restore_index = release_count;
     for (unsigned i = 0; i < count; ++i) {
         if (i > wheel_index) {
-            CGKeyCode code = (CGKeyCode)CGEventGetIntegerValueField(events[i], kCGKeyboardEventKeycode);
+            unsigned physical = released[--restore_index];
+            const ModifierKeys *key = &keys[physical / 2];
+            CGKeyCode code = physical % 2 ? key->right_key : key->left_key;
             /* Hardware can release the key while this callback is posting.
              * Never synthesize a fresh press after that real release. The
              * private injection source is not the physical HID state table. */
             if (!CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code))
                 continue;
-            temporary |= (code == codes[0] ? sides[0] : sides[1]) | key->aggregate;
+            temporary |= (physical % 2 ? key->right_flag : key->left_flag) | key->aggregate;
             CGEventSetFlags(events[i], temporary);
         }
         CGEventSetTimestamp(events[i], timestamp + i);
