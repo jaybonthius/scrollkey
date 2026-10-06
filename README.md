@@ -24,6 +24,33 @@ Quit DragScroll and disable your Karabiner mouse-to-scroll rule before testing; 
 
 The Makefile uses Apple's Clang and the macOS SDK through `xcrun`, respecting explicit `CC`/`CFLAGS` overrides. Grant Accessibility access in **System Settings → Privacy & Security → Accessibility**. Use the `+` picker and Command–Shift–G to select the executable's full path if needed. Depending on launch context, macOS may list the launching terminal instead. Check Input Monitoring too if creating the event tap is denied, then quit and rerun. Rebuilding or moving the executable may require renewed approval. The program reports missing access; it does not change privacy settings or require `sudo`.
 
+### Nix and login startup
+
+`default.nix` builds the macOS executable using Nix's compiler and SDK, without requiring host Command Line Tools. Use `pkgs.callPackage /path/to/scrollkey { }` from your Nix configuration. The package runs shared motion and CLI checks; run the native Quartz tests separately with `make test` in a graphical macOS session. `make install PREFIX=/your/prefix` is also available for native builds.
+
+For Home Manager, add the package to `home.packages` and a macOS-only LaunchAgent:
+
+```nix
+launchd.agents.scrollkey = lib.mkIf pkgs.stdenv.isDarwin {
+  enable = true;
+  config = {
+    ProgramArguments = [
+      (lib.getExe scrollkey)
+      "left_shift" "--diagonal" "off" "--diagonal-modifier" "left_control"
+    ];
+    RunAtLoad = true;
+    KeepAlive = { SuccessfulExit = false; };
+    ThrottleInterval = 30;
+    LimitLoadToSessionType = "Aqua";
+    ProcessType = "Interactive";
+  };
+};
+```
+
+The LaunchAgent runs in your graphical login session, not at system boot or through a terminal. Grant Accessibility to the installed `scrollkey` executable in **System Settings → Privacy & Security → Accessibility**; a terminal's grant does not authorize this separate launch context. The package preserves its ad-hoc code signature. Updating the executable changes its signing hash, so check its Accessibility approval after updates; no signing identity or privacy database is modified automatically. On denied access, the agent retries at most once per 30 seconds. After granting access, restart it with `launchctl kickstart -k gui/$(id -u)/org.nix-community.home.scrollkey`.
+
+Stop an existing manual instance before enabling the agent; do not run two converters together. Home Manager manages installation and removal of its LaunchAgent on subsequent switches.
+
 ## Windows
 
 From a Visual Studio Developer Command Prompt with C11-capable C++ Build Tools:

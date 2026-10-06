@@ -1,11 +1,12 @@
 CC ?= cc
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+PREFIX ?= /usr/local
 
 ifeq ($(shell uname -s),Darwin)
 ifeq ($(origin CC),default)
 CC := $(shell xcrun --sdk macosx --find clang)
 endif
-SDKFLAGS := -isysroot "$(shell xcrun --sdk macosx --show-sdk-path)"
+SDKFLAGS ?= -isysroot "$(shell xcrun --sdk macosx --show-sdk-path)"
 PLATFORM := src/macos.c
 NATIVE_TEST := build/macos-test
 NATIVE_SANITIZE_TEST := build/macos-test-sanitize
@@ -14,7 +15,7 @@ else
 LDLIBS := -lm
 endif
 
-.PHONY: all test test-sanitize clean
+.PHONY: all install test test-sanitize clean
 ifeq ($(shell uname -s),Darwin)
 all: build/scrollkey
 else
@@ -25,6 +26,10 @@ endif
 
 build/scrollkey: src/main.c src/scroll.c $(PLATFORM) src/scroll.h src/platform.h | build
 	$(CC) $(CFLAGS) $(SDKFLAGS) src/main.c src/scroll.c $(PLATFORM) $(LDLIBS) -o $@
+
+install: build/scrollkey
+	install -d "$(DESTDIR)$(PREFIX)/bin"
+	install -m755 build/scrollkey "$(DESTDIR)$(PREFIX)/bin/scrollkey"
 
 build/scroll-test: tests/scroll.c src/scroll.c src/scroll.h | build
 	$(CC) $(CFLAGS) $(SDKFLAGS) -Isrc tests/scroll.c src/scroll.c -lm -o $@
