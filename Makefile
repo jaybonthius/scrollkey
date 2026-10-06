@@ -1,0 +1,47 @@
+CC ?= cc
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+
+ifeq ($(shell uname -s),Darwin)
+ifeq ($(origin CC),default)
+CC := $(shell xcrun --sdk macosx --find clang)
+endif
+SDKFLAGS := -isysroot "$(shell xcrun --sdk macosx --show-sdk-path)"
+PLATFORM := src/macos.c
+LDLIBS := -framework ApplicationServices -framework CoreFoundation
+else
+LDLIBS := -lm
+endif
+
+.PHONY: all test test-sanitize clean
+ifeq ($(shell uname -s),Darwin)
+all: build/scrollkey
+else
+all:
+	@echo "Use build-windows.cmd on Windows; the native executable is macOS/Windows only."
+	@exit 1
+endif
+
+build/scrollkey: src/main.c src/scroll.c $(PLATFORM) src/scroll.h src/platform.h | build
+	$(CC) $(CFLAGS) $(SDKFLAGS) src/main.c src/scroll.c $(PLATFORM) $(LDLIBS) -o $@
+
+build/scroll-test: tests/scroll.c tests/fixtures.h src/scroll.c src/scroll.h | build
+	$(CC) $(CFLAGS) $(SDKFLAGS) -Isrc tests/scroll.c src/scroll.c -lm -o $@
+
+build/cli-test: src/main.c tests/platform_stub.c src/platform.h | build
+	$(CC) $(CFLAGS) $(SDKFLAGS) -Isrc src/main.c tests/platform_stub.c -lm -o $@
+
+build/scroll-test-sanitize: tests/scroll.c tests/fixtures.h src/scroll.c src/scroll.h | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $(SDKFLAGS) -Isrc tests/scroll.c src/scroll.c -lm -o $@
+
+test: build/scroll-test build/cli-test
+	./build/scroll-test
+	sh tests/cli.sh ./build/cli-test
+
+test-sanitize: build/scroll-test-sanitize
+	./build/scroll-test-sanitize
+
+build:
+	mkdir -p build
+
+clean:
+	rm -rf build
